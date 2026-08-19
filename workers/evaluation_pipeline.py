@@ -16,11 +16,52 @@ thresholds exercise without external services.
 import json
 import logging
 import re
+import time
+from contextlib import contextmanager
 from typing import Any
 
 from workers.semantic_similarity import calculate_semantic_similarity
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _traced_stage(stage: str, session_id: str):
+    """Wrap a single evaluation-pipeline stage with structured start/finish/
+    failure logging so a crash can be traced back to the exact stage (and
+    session) that caused it, without altering the stage's own logic.
+
+    On success, logs the stage name, session_id, and elapsed time.
+    On failure, logs the stage name, session_id, and exception (with
+    traceback) at ERROR level, then re-raises so calling behavior is
+    unchanged.
+    """
+    started = time.monotonic()
+    logger.info(
+        "evaluation_pipeline_stage_start stage=%s session_id=%s",
+        stage,
+        session_id,
+    )
+    try:
+        yield
+    except Exception:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+        logger.error(
+            "evaluation_pipeline_stage_failed stage=%s session_id=%s elapsed_ms=%s",
+            stage,
+            session_id,
+            elapsed_ms,
+            exc_info=True,
+        )
+        raise
+    else:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+        logger.info(
+            "evaluation_pipeline_stage_complete stage=%s session_id=%s elapsed_ms=%s",
+            stage,
+            session_id,
+            elapsed_ms,
+        )
 
 
 from workers._stubs import _seeded_unit
@@ -645,18 +686,33 @@ def score_answer(question: str, answer: str) -> dict[str, Any]:
 
 
 def evaluate_answers(session_id: str) -> dict[str, Any]:
-    """Execute answer evaluation pipeline for an interview session."""
+    """Execute answer evaluation pipeline for an interview session.
+
+    Each stage is wrapped with structured start/complete/failure logging
+    (see `_traced_stage`) so that if the pipeline crashes, the logs pinpoint
+    exactly which stage failed rather than surfacing a single opaque
+    traceback for the whole task.
+    """
     logger.info(f"Starting answer evaluation for session {session_id}")
 
-    quality = evaluate_answer_quality(session_id)
-    accuracy = evaluate_technical_accuracy(session_id)
-    clarity = evaluate_communication(session_id)
-    hallucination = evaluate_hallucination(
-        session_id,
-        "Describe your experience with distributed systems.",
-        "I have five years of experience building distributed systems in Python and Go.",
-    )
-    feedback = generate_feedback(session_id)
+    with _traced_stage("answer_quality", session_id):
+        quality = evaluate_answer_quality(session_id)
+
+    with _traced_stage("technical_accuracy", session_id):
+        accuracy = evaluate_technical_accuracy(session_id)
+
+    with _traced_stage("communication_clarity", session_id):
+        clarity = evaluate_communication(session_id)
+
+    with _traced_stage("hallucination_check", session_id):
+        hallucination = evaluate_hallucination(
+            session_id,
+            "Describe your experience with distributed systems.",
+            "I have five years of experience building distributed systems in Python and Go.",
+        )
+
+    with _traced_stage("feedback_generation", session_id):
+        feedback = generate_feedback(session_id)
 
     results = {
         "session_id": session_id,
@@ -668,7 +724,9 @@ def evaluate_answers(session_id: str) -> dict[str, Any]:
         "risk_score": 0.0,
     }
 
-    results["risk_score"] = calculate_evaluation_risk_score(results)
+    with _traced_stage("risk_scoring", session_id):
+        results["risk_score"] = calculate_evaluation_risk_score(results)
+
     logger.info(f"Answer evaluation completed for session {session_id}: {results}")
     return results
 

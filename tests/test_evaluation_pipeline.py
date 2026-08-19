@@ -1,11 +1,19 @@
 """
-Tests for the evaluation pipeline's handling of malformed LLM JSON output.
+Tests for the evaluation pipeline's handling of malformed LLM JSON output,
+and for its per-stage structured logging/tracing.
 
 Covers issue #114: LLM JSON parsing crashes Celery worker tasks due to
 missing exception handling.
+
+Covers issue #33: Pipeline stage logging/tracing — structured logging at
+each stage of the evaluation pipeline so failures can be traced to a
+specific stage.
 """
 
+import logging
 from unittest.mock import patch
+
+import pytest
 
 from workers import evaluation_pipeline
 
@@ -82,3 +90,49 @@ def test_score_answer_falls_back_on_invalid_json():
 
     assert result["score"] == 5.0
     assert "strengths" in result and "gaps" in result
+
+
+def test_stage_failure_is_traced_to_the_failing_stage(caplog):
+    """Simulated failure: if a single stage (technical_accuracy) blows up,
+    the logs should clearly identify that exact stage and session, the
+    pipeline should stop there (no swallowed exception, no unrelated
+    'succeeded' log for that stage), and earlier stages should still show
+    as completed."""
+    with (
+        caplog.at_level(logging.INFO, logger="workers.evaluation_pipeline"),
+        patch(
+            "workers.evaluation_pipeline.evaluate_technical_accuracy",
+            side_effect=RuntimeError("boom"),
+        ),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        evaluation_pipeline.evaluate_answers("session-failure-test")
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # The prior stage completed...
+    assert any(
+        "evaluation_pipeline_stage_complete" in m and "stage=answer_quality" in m
+        for m in messages
+    )
+    # ...the failing stage was entered...
+    assert any(
+        "evaluation_pipeline_stage_start" in m and "stage=technical_accuracy" in m
+        for m in messages
+    )
+    # ...and logged as failed, at ERROR level, tagged with the right stage
+    # and session, with the traceback captured.
+    failure_records = [
+        r
+        for r in caplog.records
+        if "evaluation_pipeline_stage_failed" in r.getMessage()
+    ]
+    assert len(failure_records) == 1
+    failure_record = failure_records[0]
+    assert failure_record.levelno == logging.ERROR
+    assert "stage=technical_accuracy" in failure_record.getMessage()
+    assert "session_id=session-failure-test" in failure_record.getMessage()
+    assert failure_record.exc_info is not None
+
+    # Later stages never ran.
+    assert not any("stage=communication_clarity" in m for m in messages)
